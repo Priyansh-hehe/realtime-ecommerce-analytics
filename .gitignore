@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Environment variables & secrets
+.env
+
+# Data files (avoid committing large CSVs)
+data/raw/*.csv
+data/raw/*.xlsx
+
+# OS files
+.DS_Store
+Thumbs.db
