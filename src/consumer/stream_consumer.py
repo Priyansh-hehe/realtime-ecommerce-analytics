@@ -1,13 +1,13 @@
 """
 src/consumer/stream_consumer.py
 -------------------------------
-Stream Consumer, Schema Validator, and Dead-Letter Queue (DLQ) Router.
+Stream Consumer, Pydantic Schema Validator, and Dead-Letter Queue (DLQ) Router.
 
 Responsibilities:
 1. Subscribes to `ecommerce-events` topic.
-2. Deserializes JSON payloads and performs strict schema validation and type cleansing.
-3. Classifies transaction types (PURCHASE, RETURN / CANCELLATION, GUEST_CHECKOUT).
-4. Routes malformed, corrupt, or invalid business records to `ecommerce-dead-letter` topic.
+2. Validates & cleanses JSON payloads using Pydantic v2 (`TransactionEvent`).
+3. Classifies transaction types (PURCHASE, RETURN / CANCELLATION, PROMO_FREE, GUEST).
+4. Routes malformed or invalid business records to `ecommerce-dead-letter` topic using `DeadLetterEnvelope`.
 5. Manages manual offset commits for reliable processing guarantees.
 """
 
@@ -19,10 +19,11 @@ import time
 import signal
 import logging
 import argparse
+from typing import Tuple, Optional, Any
 from datetime import datetime, timezone
-from typing import Tuple, Optional, Dict, Any
 
 from confluent_kafka import Consumer, Producer, KafkaError, KafkaException
+from pydantic import BaseModel, Field, field_validator, model_validator, ValidationError
 
 # Ensure clean UTF-8 console output for Windows terminal
 if sys.platform == "win32":
@@ -52,6 +53,87 @@ signal.signal(signal.SIGINT, handle_sigint)
 signal.signal(signal.SIGTERM, handle_sigint)
 
 
+# ==========================================
+# Pydantic Validation & DLQ Schemas
+# ==========================================
+
+class TransactionEvent(BaseModel):
+    """Validated, cleansed e-commerce transaction event."""
+    event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    invoice_no: str = Field(..., min_length=1, description="Invoice identifier")
+    stock_code: str = Field(..., min_length=1, description="Product SKU")
+    description: Optional[str] = Field(default="NO DESCRIPTION", description="Product description")
+    quantity: int = Field(..., description="Quantity ordered")
+    unit_price: float = Field(..., ge=0.0, description="Unit price (must be >= 0.0)")
+    total_amount: Optional[float] = Field(default=None, description="Computed: quantity * unit_price")
+    invoice_date: str = Field(..., min_length=1, description="Transaction date/time string")
+    customer_id: Optional[int] = Field(default=None, description="Customer ID or None for guest")
+    country: str = Field(default="Unknown", description="Country of purchase")
+    
+    # Pipeline-derived attributes
+    event_type: str = Field(default="PURCHASE", description="PURCHASE, RETURN, or PROMO_FREE")
+    is_cancellation: bool = Field(default=False, description="True if invoice starts with C or quantity < 0")
+    is_guest: bool = Field(default=False, description="True if customer_id is None")
+    processed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @field_validator("invoice_no", "stock_code", mode="before")
+    @classmethod
+    def clean_strings(cls, v: Any) -> str:
+        if v is None:
+            raise ValueError("Field cannot be null")
+        s = str(v).strip()
+        if not s:
+            raise ValueError("Field cannot be empty string")
+        return s
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def clean_description(cls, v: Any) -> str:
+        if v is None or str(v).strip().lower() in ("nan", "none", "null", ""):
+            return "NO DESCRIPTION"
+        return str(v).strip()
+
+    @field_validator("customer_id", mode="before")
+    @classmethod
+    def clean_customer_id(cls, v: Any) -> Optional[int]:
+        if v is None or str(v).strip().lower() in ("nan", "none", "null", ""):
+            return None
+        try:
+            return int(float(v))
+        except (ValueError, TypeError):
+            return None
+
+    @model_validator(mode="after")
+    def compute_derived_fields(self) -> "TransactionEvent":
+        self.total_amount = round(self.quantity * self.unit_price, 2)
+        if self.invoice_no.upper().startswith("C") or self.quantity < 0:
+            self.is_cancellation = True
+            self.event_type = "RETURN"
+        elif self.unit_price == 0.0:
+            self.event_type = "PROMO_FREE"
+        else:
+            self.event_type = "PURCHASE"
+
+        self.is_guest = self.customer_id is None
+        return self
+
+
+class DeadLetterEnvelope(BaseModel):
+    """Schema for rejected/corrupt messages routed to DLQ."""
+    dlq_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    error_reason: str
+    error_details: Optional[str] = None
+    original_topic: str
+    original_partition: int
+    original_offset: int
+    raw_payload: str
+    rejected_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+# ==========================================
+# Consumer Metrics & Execution
+# ==========================================
+
 class ConsumerMetrics:
     """Tracks consumer performance and validation statistics."""
     def __init__(self):
@@ -71,93 +153,24 @@ class ConsumerMetrics:
             f"Valid: {self.valid_count:>6,} | "
             f"DLQ: {self.dlq_count:>3} | "
             f"Rate: {rate:>5.1f}/s | "
-            f"[{event_type:<8}] Inv: {invoice_no:<8} | "
+            f"[{event_type:<10}] Inv: {invoice_no:<8} | "
             f"${amount:>7.2f}"
         )
 
 
-def validate_and_cleanse_event(raw_payload: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+def validate_and_cleanse_event(raw_payload: str) -> Tuple[bool, Optional[TransactionEvent], Optional[str], Optional[str]]:
     """
-    Validates and cleanses raw incoming event JSON.
-
-    Returns:
-        (is_valid, cleansed_event_dict, error_reason)
+    Validates and cleanses raw incoming event JSON using Pydantic v2.
     """
-    # 1. JSON Parsing Check
     try:
-        data = json.loads(raw_payload)
+        event = TransactionEvent.model_validate_json(raw_payload)
+        return True, event, None, None
+    except ValidationError as ve:
+        errors = [f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}" for err in ve.errors()]
+        error_details = " | ".join(errors)
+        return False, None, "SCHEMA_VALIDATION_ERROR", error_details
     except Exception as e:
-        return False, None, f"CORRUPT_JSON_SYNTAX: {str(e)}"
-
-    if not isinstance(data, dict):
-        return False, None, "INVALID_ROOT_TYPE: Expected JSON object"
-
-    # 2. Mandatory Fields Check
-    required_fields = ["invoice_no", "stock_code", "quantity", "unit_price", "invoice_date"]
-    missing = [field for field in required_fields if field not in data or data[field] is None or str(data[field]).strip() == ""]
-    if missing:
-        return False, data, f"MISSING_REQUIRED_FIELDS: {', '.join(missing)}"
-
-    # 3. Numeric & Business Validation
-    try:
-        quantity = int(data["quantity"])
-    except (ValueError, TypeError):
-        return False, data, f"INVALID_QUANTITY_TYPE: '{data.get('quantity')}' is not a valid integer"
-
-    try:
-        unit_price = float(data["unit_price"])
-    except (ValueError, TypeError):
-        return False, data, f"INVALID_PRICE_TYPE: '{data.get('unit_price')}' is not a valid float"
-
-    # Edge Case: Negative Unit Price is an invalid accounting error -> DLQ
-    if unit_price < 0:
-        return False, data, f"INVALID_NEGATIVE_PRICE: Unit price cannot be negative (${unit_price})"
-
-    # 4. Cleanse & Standardize Fields
-    invoice_no = str(data["invoice_no"]).strip()
-    stock_code = str(data["stock_code"]).strip()
-    description = str(data.get("description", "")).strip() or "NO DESCRIPTION"
-    country = str(data.get("country", "Unknown")).strip()
-    invoice_date = str(data["invoice_date"]).strip()
-
-    # Customer ID Handling (Guest vs Registered)
-    raw_cust = data.get("customer_id")
-    customer_id = None
-    if raw_cust is not None and str(raw_cust).strip().lower() not in ("nan", "none", "null", ""):
-        try:
-            customer_id = int(float(raw_cust))
-        except (ValueError, TypeError):
-            customer_id = str(raw_cust).strip()
-
-    # Classify Event Type
-    is_cancellation = invoice_no.upper().startswith("C") or quantity < 0
-    if is_cancellation:
-        event_type = "RETURN"
-    elif unit_price == 0.0:
-        event_type = "PROMO_FREE"
-    else:
-        event_type = "PURCHASE"
-
-    total_amount = round(quantity * unit_price, 2)
-
-    cleansed = {
-        "event_id": data.get("event_id") or str(uuid.uuid4()),
-        "invoice_no": invoice_no,
-        "stock_code": stock_code,
-        "description": description,
-        "quantity": quantity,
-        "unit_price": unit_price,
-        "total_amount": total_amount,
-        "invoice_date": invoice_date,
-        "customer_id": customer_id,
-        "country": country,
-        "event_type": event_type,
-        "is_cancellation": is_cancellation,
-        "is_guest": customer_id is None,
-        "processed_at": datetime.now(timezone.utc).isoformat()
-    }
-
-    return True, cleansed, None
+        return False, None, "CORRUPT_JSON_SYNTAX", str(e)
 
 
 def send_to_dead_letter_queue(
@@ -167,28 +180,28 @@ def send_to_dead_letter_queue(
     partition: int,
     offset: int,
     raw_payload: str,
-    error_reason: str
+    error_reason: str,
+    error_details: Optional[str]
 ):
     """
-    Wraps bad records with error context and publishes them to the DLQ topic.
+    Wraps bad records into a structured DeadLetterEnvelope and publishes to the DLQ topic.
     """
-    dlq_envelope = {
-        "dlq_id": str(uuid.uuid4()),
-        "error_reason": error_reason,
-        "original_topic": original_topic,
-        "original_partition": partition,
-        "original_offset": offset,
-        "raw_payload": raw_payload,
-        "rejected_at": datetime.now(timezone.utc).isoformat()
-    }
+    envelope = DeadLetterEnvelope(
+        error_reason=error_reason,
+        error_details=error_details,
+        original_topic=original_topic,
+        original_partition=partition,
+        original_offset=offset,
+        raw_payload=raw_payload
+    )
     
     dlq_producer.produce(
         topic=dlq_topic,
         key=str(offset).encode("utf-8"),
-        value=json.dumps(dlq_envelope).encode("utf-8")
+        value=envelope.model_dump_json().encode("utf-8")
     )
     dlq_producer.poll(0)
-    logger.warning(f"⚠️ [DLQ Route] Part: {partition} | Off: {offset} | Reason: {error_reason}")
+    logger.warning(f"[DLQ Route] Part: {partition} | Off: {offset} | Reason: {error_reason} ({error_details})")
 
 
 def run_consumer(
@@ -202,16 +215,14 @@ def run_consumer(
     """
     global running
 
-    # Consumer Configuration
     consumer_conf = {
         "bootstrap.servers": bootstrap_servers,
         "group.id": group_id,
         "auto.offset.reset": "earliest",
-        "enable.auto.commit": False,      # Manual commit for reliable processing
+        "enable.auto.commit": False,
         "max.poll.interval.ms": 300000,
     }
 
-    # DLQ Producer Configuration
     dlq_producer_conf = {
         "bootstrap.servers": bootstrap_servers,
         "client.id": "ecommerce-dlq-producer",
@@ -248,28 +259,27 @@ def run_consumer(
             partition = msg.partition()
             offset = msg.offset()
 
-            # Validate and cleanse incoming event
-            is_valid, event, error_reason = validate_and_cleanse_event(raw_payload)
+            # Validate and cleanse incoming event via Pydantic model
+            is_valid, event, error_reason, error_details = validate_and_cleanse_event(raw_payload)
 
-            if is_valid:
+            if is_valid and event is not None:
                 metrics.valid_count += 1
-                if event["event_type"] == "RETURN":
+                if event.event_type == "RETURN":
                     metrics.return_count += 1
-                elif event["event_type"] == "PURCHASE":
+                elif event.event_type == "PURCHASE":
                     metrics.purchase_count += 1
                 
-                if event["is_guest"]:
+                if event.is_guest:
                     metrics.guest_count += 1
 
                 # Periodic progress logging
                 if metrics.total_received % 100 == 0 or metrics.total_received == 1:
                     metrics.print_progress(
-                        event["event_type"],
-                        event["invoice_no"],
-                        event["total_amount"]
+                        event.event_type,
+                        event.invoice_no,
+                        event.total_amount or 0.0
                     )
             else:
-                # Malformed / Invalid event -> route to DLQ
                 metrics.dlq_count += 1
                 send_to_dead_letter_queue(
                     dlq_producer=dlq_producer,
@@ -278,12 +288,12 @@ def run_consumer(
                     partition=partition,
                     offset=offset,
                     raw_payload=raw_payload,
-                    error_reason=error_reason
+                    error_reason=error_reason or "UNKNOWN_ERROR",
+                    error_details=error_details
                 )
 
             uncommitted_count += 1
 
-            # Batch offset commit every 100 messages to balance throughput and safety
             if uncommitted_count >= 100:
                 consumer.commit(asynchronous=False)
                 uncommitted_count = 0
@@ -292,13 +302,11 @@ def run_consumer(
         if running:
             logger.error(f"Unexpected consumer error: {e}", exc_info=True)
     finally:
-        # Commit final offsets before exiting
         try:
             consumer.commit(asynchronous=False)
         except Exception:
             pass
 
-        # Flush any remaining DLQ messages
         dlq_producer.flush(timeout=5.0)
         consumer.close()
 
