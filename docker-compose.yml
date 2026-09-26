@@ -1,4 +1,8 @@
 services:
+
+  # ─────────────────────────────────────────
+  # Kafka Broker (KRaft mode, no Zookeeper)
+  # ─────────────────────────────────────────
   kafka:
     image: apache/kafka:3.9.0
     container_name: kafka-ecommerce
@@ -27,4 +31,47 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
+    networks:
+      - ecommerce-net
     restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # PostgreSQL 16 — Persistent analytics store
+  # ─────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-ecommerce
+    hostname: postgres
+    ports:
+      # Exposes Postgres to your host machine for local inspection / DBeaver
+      - "5432:5432"
+    environment:
+      POSTGRES_DB:       ecommerce
+      POSTGRES_USER:     ecom_user
+      POSTGRES_PASSWORD: ecom_pass
+    volumes:
+      # Named volume — data survives container restarts
+      - postgres-data:/var/lib/postgresql/data
+      # Auto-runs schema.sql the FIRST time the container starts
+      - ./src/sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ecom_user -d ecommerce"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+# ─────────────────────────────────────────
+# Shared bridge network
+# ─────────────────────────────────────────
+networks:
+  ecommerce-net:
+    driver: bridge
+
+# ─────────────────────────────────────────
+# Named volumes
+# ─────────────────────────────────────────
+volumes:
+  postgres-data:

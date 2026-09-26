@@ -21,7 +21,7 @@ from confluent_kafka import Producer, KafkaError
 
 # Ensure clean UTF-8 console output for Windows terminals
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8")
+    getattr(sys.stdout, "reconfigure", lambda **kw: None)(encoding="utf-8")
 
 # Setup logging
 logging.basicConfig(

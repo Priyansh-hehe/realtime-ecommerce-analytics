@@ -17,7 +17,7 @@ import pandas as pd
 
 # Ensure UTF-8 output encoding for Windows terminal
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8")
+    getattr(sys.stdout, "reconfigure", lambda **kw: None)(encoding="utf-8")
 
 RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "raw")
 OUTPUT_CSV = os.path.join(RAW_DIR, "online_retail.csv")

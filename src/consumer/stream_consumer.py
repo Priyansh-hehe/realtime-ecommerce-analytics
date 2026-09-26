@@ -1,14 +1,17 @@
 """
 src/consumer/stream_consumer.py
 -------------------------------
-Stream Consumer, Pydantic Schema Validator, and Dead-Letter Queue (DLQ) Router.
+Stream Consumer, Pydantic Schema Validator, Dead-Letter Queue (DLQ) Router,
+and PostgreSQL Persistence Layer.
 
 Responsibilities:
 1. Subscribes to `ecommerce-events` topic.
 2. Validates & cleanses JSON payloads using Pydantic v2 (`TransactionEvent`).
 3. Classifies transaction types (PURCHASE, RETURN / CANCELLATION, PROMO_FREE, GUEST).
 4. Routes malformed or invalid business records to `ecommerce-dead-letter` topic using `DeadLetterEnvelope`.
-5. Manages manual offset commits for reliable processing guarantees.
+5. Persists every valid event to PostgreSQL `transactions` table.
+6. Persists every rejected event to PostgreSQL `dead_letter_queue` table (dual-write with Kafka DLQ).
+7. Manages manual offset commits for reliable processing guarantees.
 """
 
 import os
@@ -21,13 +24,18 @@ import logging
 import argparse
 from typing import Tuple, Optional, Any
 from datetime import datetime, timezone
+from pathlib import Path
+
+# Allow imports from src/utils without package install
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from confluent_kafka import Consumer, Producer, KafkaError, KafkaException
 from pydantic import BaseModel, Field, field_validator, model_validator, ValidationError
+from src.utils import db
 
 # Ensure clean UTF-8 console output for Windows terminal
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8")
+    getattr(sys.stdout, "reconfigure", lambda **kw: None)(encoding="utf-8")
 
 # Setup logging
 logging.basicConfig(
@@ -211,9 +219,12 @@ def run_consumer(
     bootstrap_servers: str = "localhost:9092"
 ):
     """
-    Main consumer loop.
+    Main consumer loop with PostgreSQL persistence.
     """
     global running
+
+    # ── PostgreSQL pool ──────────────────────────────────────────
+    db.init_pool(min_size=2, max_size=10)
 
     consumer_conf = {
         "bootstrap.servers": bootstrap_servers,
@@ -268,9 +279,20 @@ def run_consumer(
                     metrics.return_count += 1
                 elif event.event_type == "PURCHASE":
                     metrics.purchase_count += 1
-                
+
                 if event.is_guest:
                     metrics.guest_count += 1
+
+                # ── Persist to PostgreSQL ────────────────────────
+                try:
+                    db.insert_transaction({
+                        **event.model_dump(),
+                        "kafka_topic":     input_topic,
+                        "kafka_partition": partition,
+                        "kafka_offset":    offset,
+                    })
+                except Exception as db_err:
+                    logger.error(f"[DB] Failed to insert transaction: {db_err}")
 
                 # Periodic progress logging
                 if metrics.total_received % 100 == 0 or metrics.total_received == 1:
@@ -281,6 +303,8 @@ def run_consumer(
                     )
             else:
                 metrics.dlq_count += 1
+
+                # ── Route to Kafka DLQ topic ─────────────────────
                 send_to_dead_letter_queue(
                     dlq_producer=dlq_producer,
                     dlq_topic=dlq_topic,
@@ -291,6 +315,20 @@ def run_consumer(
                     error_reason=error_reason or "UNKNOWN_ERROR",
                     error_details=error_details
                 )
+
+                # ── Dual-write: also persist DLQ record to Postgres
+                envelope = DeadLetterEnvelope(
+                    error_reason=error_reason or "UNKNOWN_ERROR",
+                    error_details=error_details,
+                    original_topic=input_topic,
+                    original_partition=partition,
+                    original_offset=offset,
+                    raw_payload=raw_payload,
+                )
+                try:
+                    db.insert_dead_letter(envelope.model_dump())
+                except Exception as db_err:
+                    logger.error(f"[DB] Failed to insert DLQ record: {db_err}")
 
             uncommitted_count += 1
 
@@ -309,6 +347,7 @@ def run_consumer(
 
         dlq_producer.flush(timeout=5.0)
         consumer.close()
+        db.close_pool()
 
         elapsed = time.time() - metrics.start_time
         avg_rate = metrics.total_received / elapsed if elapsed > 0 else 0
