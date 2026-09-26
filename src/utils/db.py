@@ -63,14 +63,14 @@ _INSERT_TRANSACTION = """
         customer_id, country,
         event_type, is_cancellation, is_guest,
         kafka_topic, kafka_partition, kafka_offset,
-        processed_at
+        produced_at, processed_at, latency_ms
     ) VALUES (
         %(event_id)s, %(invoice_no)s, %(stock_code)s, %(description)s,
         %(quantity)s, %(unit_price)s, %(total_amount)s, %(invoice_date)s,
         %(customer_id)s, %(country)s,
         %(event_type)s, %(is_cancellation)s, %(is_guest)s,
         %(kafka_topic)s, %(kafka_partition)s, %(kafka_offset)s,
-        %(processed_at)s
+        COALESCE(%(produced_at)s::timestamptz, NOW()), %(processed_at)s, %(latency_ms)s
     )
     ON CONFLICT (event_id) DO NOTHING;
 """

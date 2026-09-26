@@ -51,9 +51,11 @@ CREATE TABLE IF NOT EXISTS transactions (
     kafka_partition INTEGER,
     kafka_offset    BIGINT,
 
-    -- Timestamps
+    -- Timestamps & End-to-End Latency Tracking
+    produced_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     processed_at    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    inserted_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+    inserted_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    latency_ms      NUMERIC(10, 2)  -- End-to-end latency: (inserted_at - produced_at) in milliseconds
 );
 
 -- Indexes for common analytics query patterns
@@ -62,6 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_txn_customer_id   ON transactions (customer_id);
 CREATE INDEX IF NOT EXISTS idx_txn_event_type    ON transactions (event_type);
 CREATE INDEX IF NOT EXISTS idx_txn_country       ON transactions (country);
 CREATE INDEX IF NOT EXISTS idx_txn_processed_at  ON transactions (processed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_txn_latency_ms    ON transactions (latency_ms);
 
 
 -- ─────────────────────────────────────────────────────────────
@@ -125,3 +128,17 @@ SELECT
 FROM dead_letter_queue
 GROUP BY error_reason
 ORDER BY occurrences DESC;
+
+
+-- End-to-End Streaming Pipeline Latency & Health View
+CREATE OR REPLACE VIEW v_pipeline_latency_metrics AS
+SELECT
+    COUNT(*)                                              AS total_events_processed,
+    ROUND(AVG(latency_ms), 2)                             AS avg_latency_ms,
+    ROUND(MIN(latency_ms), 2)                             AS min_latency_ms,
+    ROUND(MAX(latency_ms), 2)                             AS max_latency_ms,
+    ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY latency_ms)::numeric, 2) AS p50_latency_ms,
+    ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms)::numeric, 2) AS p95_latency_ms,
+    ROUND(PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY latency_ms)::numeric, 2) AS p99_latency_ms
+FROM transactions
+WHERE latency_ms IS NOT NULL;

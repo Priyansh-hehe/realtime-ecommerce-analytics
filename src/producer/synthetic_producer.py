@@ -130,6 +130,7 @@ def generate_valid_event(custom_event_id: Optional[str] = None) -> Dict[str, Any
         "invoice_date": datetime.now(timezone.utc).strftime("%m/%d/%Y %H:%M"),
         "customer_id": customer_id,
         "country": choose_country(),
+        "produced_at": datetime.now(timezone.utc).isoformat(),
     }
 
 

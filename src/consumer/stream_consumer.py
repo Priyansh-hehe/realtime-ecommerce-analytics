@@ -102,11 +102,13 @@ class TransactionEvent(BaseModel):
     customer_id: Optional[int] = Field(default=None, description="Customer ID or None for guest")
     country: str = Field(default="Unknown", description="Country of purchase")
     
-    # Pipeline-derived attributes
+    # Pipeline-derived attributes & Latency tracking
     event_type: str = Field(default="PURCHASE", description="PURCHASE, RETURN, or PROMO_FREE")
     is_cancellation: bool = Field(default=False, description="True if invoice starts with C or quantity < 0")
     is_guest: bool = Field(default=False, description="True if customer_id is None")
+    produced_at: Optional[str] = Field(default=None, description="Producer UTC timestamp")
     processed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    latency_ms: Optional[float] = Field(default=None, description="End-to-end pipeline latency in ms")
 
     @field_validator("invoice_no", "stock_code", mode="before")
     @classmethod
@@ -147,6 +149,17 @@ class TransactionEvent(BaseModel):
             self.event_type = "PURCHASE"
 
         self.is_guest = self.customer_id is None
+
+        # Compute end-to-end latency in milliseconds
+        if self.produced_at:
+            try:
+                prod_dt = datetime.fromisoformat(self.produced_at.replace("Z", "+00:00"))
+                proc_dt = datetime.fromisoformat(self.processed_at)
+                diff = (proc_dt - prod_dt).total_seconds() * 1000.0
+                self.latency_ms = round(max(0.0, diff), 2)
+            except Exception:
+                self.latency_ms = None
+
         return self
 
 
@@ -167,7 +180,7 @@ class DeadLetterEnvelope(BaseModel):
 # ==========================================
 
 class ConsumerMetrics:
-    """Tracks consumer performance and validation statistics."""
+    """Tracks consumer performance, validation statistics, and pipeline latency."""
     def __init__(self):
         self.total_received = 0
         self.valid_count = 0
@@ -175,16 +188,23 @@ class ConsumerMetrics:
         self.purchase_count = 0
         self.return_count = 0
         self.guest_count = 0
+        self.latencies: List[float] = []
         self.start_time = time.time()
 
-    def print_progress(self, event_type: str, invoice_no: str, amount: float):
+    def record_latency(self, latency_ms: Optional[float]):
+        if latency_ms is not None:
+            self.latencies.append(latency_ms)
+
+    def print_progress(self, event_type: str, invoice_no: str, amount: float, latency_ms: Optional[float]):
         elapsed = time.time() - self.start_time
         rate = self.total_received / elapsed if elapsed > 0 else 0
+        lat_str = f"{latency_ms:>5.1f}ms" if latency_ms is not None else "  N/A  "
         logger.info(
             f">> [Consumer] Recv: {self.total_received:>6,} | "
             f"Valid: {self.valid_count:>6,} | "
             f"DLQ: {self.dlq_count:>3} | "
             f"Rate: {rate:>5.1f}/s | "
+            f"Lat: {lat_str} | "
             f"[{event_type:<10}] Inv: {invoice_no:<8} | "
             f"${amount:>7.2f}"
         )
@@ -312,8 +332,8 @@ def run_consumer(
                 elif event.event_type == "PURCHASE":
                     metrics.purchase_count += 1
 
-                if event.is_guest:
-                    metrics.guest_count += 1
+                # ── Record latency metric ────────────────────────
+                metrics.record_latency(event.latency_ms)
 
                 # ── Persist to PostgreSQL ────────────────────────
                 try:
@@ -331,7 +351,8 @@ def run_consumer(
                     metrics.print_progress(
                         event.event_type,
                         event.invoice_no,
-                        event.total_amount or 0.0
+                        event.total_amount or 0.0,
+                        event.latency_ms
                     )
             else:
                 metrics.dlq_count += 1
@@ -384,16 +405,32 @@ def run_consumer(
         elapsed = time.time() - metrics.start_time
         avg_rate = metrics.total_received / elapsed if elapsed > 0 else 0
 
+        # Calculate latency percentiles
+        lat_count = len(metrics.latencies)
+        avg_lat = sum(metrics.latencies) / lat_count if lat_count > 0 else 0.0
+        sorted_lats = sorted(metrics.latencies)
+        p50 = sorted_lats[int(lat_count * 0.50)] if lat_count > 0 else 0.0
+        p95 = sorted_lats[int(lat_count * 0.95)] if lat_count > 0 else 0.0
+        p99 = sorted_lats[int(lat_count * 0.99)] if lat_count > 0 else 0.0
+        min_lat = sorted_lats[0] if lat_count > 0 else 0.0
+        max_lat = sorted_lats[-1] if lat_count > 0 else 0.0
+
         print("\n" + "="*60)
         logger.info("CONSUMER SESSION SUMMARY:")
         logger.info(f"   * Total Received:   {metrics.total_received:,}")
         logger.info(f"   * Valid Cleaned:    {metrics.valid_count:,}")
         logger.info(f"   * Purchases:        {metrics.purchase_count:,}")
         logger.info(f"   * Returns/Refunds:  {metrics.return_count:,}")
-        logger.info(f"   * Guest Checkouts:  {metrics.guest_count:,}")
         logger.info(f"   * Routed to DLQ:    {metrics.dlq_count:,}")
         logger.info(f"   * Elapsed Time:     {elapsed:.2f}s")
         logger.info(f"   * Processing Speed: {avg_rate:.1f} events/sec")
+        if lat_count > 0:
+            logger.info("PIPELINE LATENCY (End-to-End):")
+            logger.info(f"   * Average Latency:  {avg_lat:.2f} ms")
+            logger.info(f"   * Min / Max:        {min_lat:.2f} ms / {max_lat:.2f} ms")
+            logger.info(f"   * p50 (Median):     {p50:.2f} ms")
+            logger.info(f"   * p95 (Tail):       {p95:.2f} ms")
+            logger.info(f"   * p99 (Worst Case): {p99:.2f} ms")
         print("="*60 + "\n")
 
 

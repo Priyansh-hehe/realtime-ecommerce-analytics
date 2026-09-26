@@ -1,0 +1,39 @@
+# =============================================================
+# Dockerfile.producer
+# Real-Time E-Commerce Analytics — Event Producer Service
+# =============================================================
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Prevent Python from writing .pyc files and buffer stdout
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application source code and raw data
+COPY src/ ./src/
+COPY data/ ./data/
+
+# Environment variables for traffic control (customizable at runtime)
+ENV SCENARIO=CHAOS \
+    RATE=30.0 \
+    MAX_EVENTS=0 \
+    BOOTSTRAP_SERVERS=kafka:9092
+
+# Run the synthetic event generator
+CMD python src/producer/synthetic_producer.py \
+    --scenario "$SCENARIO" \
+    --rate "$RATE" \
+    --max-events "$MAX_EVENTS" \
+    --bootstrap-servers "$BOOTSTRAP_SERVERS"
