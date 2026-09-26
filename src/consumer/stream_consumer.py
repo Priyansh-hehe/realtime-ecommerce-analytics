@@ -4,14 +4,38 @@ src/consumer/stream_consumer.py
 Stream Consumer, Pydantic Schema Validator, Dead-Letter Queue (DLQ) Router,
 and PostgreSQL Persistence Layer.
 
-Responsibilities:
-1. Subscribes to `ecommerce-events` topic.
-2. Validates & cleanses JSON payloads using Pydantic v2 (`TransactionEvent`).
-3. Classifies transaction types (PURCHASE, RETURN / CANCELLATION, PROMO_FREE, GUEST).
-4. Routes malformed or invalid business records to `ecommerce-dead-letter` topic using `DeadLetterEnvelope`.
-5. Persists every valid event to PostgreSQL `transactions` table.
-6. Persists every rejected event to PostgreSQL `dead_letter_queue` table (dual-write with Kafka DLQ).
-7. Manages manual offset commits for reliable processing guarantees.
+==============================================================================
+KAFKA CORE ARCHITECTURAL CONCEPTS (Explained for Beginners):
+==============================================================================
+1. TOPIC:
+   The high-level category/channel where events are published (e.g. `ecommerce-events`).
+
+2. PARTITION (Parallel Lanes on a Highway):
+   Topics are split into 1 or more partitions. 
+   - Strict ordering is guaranteed *within* a single partition.
+   - Multiple partitions allow multiple consumer workers to read in parallel.
+
+3. MESSAGE KEY (Hash-based Routing):
+   When a producer sends an event with a key (e.g., `key=country` or `key=customer_id`),
+   Kafka computes `hash(key) % total_partitions` to choose the partition.
+   This guarantees all events for the SAME country/customer arrive at the SAME partition in order.
+
+4. CONSUMER GROUP (A Coordinated Team of Workers):
+   A group of consumer processes sharing a common `group.id` (e.g. `ecommerce-stream-group`).
+   Kafka automatically divides the topic's partitions evenly among members of the group:
+   - If Topic has 3 partitions & Group has 1 consumer  -> Consumer reads Partitions [0, 1, 2].
+   - If Topic has 3 partitions & Group has 3 consumers -> Each consumer reads exactly 1 partition.
+   - If Topic has 3 partitions & Group has 4 consumers -> 1 consumer is idle (hot standby).
+
+5. REBALANCING:
+   When a new consumer joins or an existing one crashes, Kafka rebalances the partitions
+   dynamically across the surviving consumers in the group with zero data loss.
+
+6. OFFSET & MANUAL COMMITS:
+   An offset is a sequential integer ID for each message inside a partition.
+   We use manual offset commits (`enable.auto.commit=False`) to guarantee that
+   we only acknowledge an offset AFTER the data is safely written to PostgreSQL.
+==============================================================================
 """
 
 import os
@@ -22,14 +46,14 @@ import time
 import signal
 import logging
 import argparse
-from typing import Tuple, Optional, Any
+from typing import Tuple, Optional, Any, List
 from datetime import datetime, timezone
 from pathlib import Path
 
 # Allow imports from src/utils without package install
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from confluent_kafka import Consumer, Producer, KafkaError, KafkaException
+from confluent_kafka import Consumer, Producer, KafkaError, KafkaException, TopicPartition
 from pydantic import BaseModel, Field, field_validator, model_validator, ValidationError
 from src.utils import db
 
@@ -244,7 +268,15 @@ def run_consumer(
     dlq_producer = Producer(dlq_producer_conf)
     metrics = ConsumerMetrics()
 
-    consumer.subscribe([input_topic])
+    def on_assign_callback(c: Consumer, partitions: List[TopicPartition]):
+        part_ids = [p.partition for p in partitions]
+        logger.info(f"🔄 [REBALANCE ASSIGNED] This consumer worker was assigned {len(partitions)} partition(s): {part_ids}")
+
+    def on_revoke_callback(c: Consumer, partitions: List[TopicPartition]):
+        part_ids = [p.partition for p in partitions]
+        logger.warning(f"⚠️ [REBALANCE REVOKED] Partitions revoked from this worker: {part_ids}")
+
+    consumer.subscribe([input_topic], on_assign=on_assign_callback, on_revoke=on_revoke_callback)
     logger.info(f"Connected to Kafka at '{bootstrap_servers}'")
     logger.info(f"Subscribed to topic '{input_topic}' (Group: '{group_id}')")
     logger.info(f"Dead-Letter Queue configured at topic '{dlq_topic}'")

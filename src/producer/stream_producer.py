@@ -5,6 +5,31 @@ Historical E-commerce Event Replayer (Kafka Producer).
 
 Streams real-world transaction events from `data/raw/online_retail.csv` into
 Apache Kafka with configurable throughput, partition key routing, and delivery tracking.
+
+==============================================================================
+PRODUCER ARCHITECTURAL CONCEPTS (Explained for Beginners):
+==============================================================================
+1. SERIALIZATION:
+   Kafka only understands raw bytes. The producer converts Python dictionaries
+   into JSON strings and encodes them as UTF-8 bytes before sending (`.encode('utf-8')`).
+
+2. MESSAGE KEYS & PARTITION ROUTING:
+   When sending a message to Kafka, the producer passes an optional `key` parameter:
+   - If key is None: Kafka distributes messages round-robin across all partitions.
+   - If key is provided (e.g. `key=country` or `key=customer_id`): Kafka hashes the key
+     using murmur2 hash and assigns it to `hash(key) % total_partitions`.
+     -> This guarantees that all transactions for the SAME customer or country
+        always land in the EXACT SAME partition in strict time order.
+
+3. ACKS (Acknowledgments):
+   - `acks=0`: Producer sends and forgets (fastest, risk of data loss).
+   - `acks=1`: Producer waits for the partition leader broker to write to disk (default).
+   - `acks=all`: Producer waits for all in-sync replicas to confirm (financial grade).
+
+4. BUFFERING & BATCHING (`linger.ms`):
+   Instead of sending 1 network packet per message, the producer groups messages
+   together into micro-batches to achieve high throughput (thousands of events/sec).
+==============================================================================
 """
 
 import os
