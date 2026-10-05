@@ -46,16 +46,16 @@ services:
       # Exposes Postgres to your host machine for local inspection / DBeaver
       - "5432:5432"
     environment:
-      POSTGRES_DB:       ecommerce
-      POSTGRES_USER:     ecom_user
-      POSTGRES_PASSWORD: ecom_pass
+      POSTGRES_DB:       ${POSTGRES_DB:-ecommerce}
+      POSTGRES_USER:     ${POSTGRES_USER:-ecom_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ecom_pass}
     volumes:
       # Named volume — data survives container restarts
       - postgres-data:/var/lib/postgresql/data
       # Auto-runs schema.sql the FIRST time the container starts
       - ./src/sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ecom_user -d ecommerce"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ecom_user} -d ${POSTGRES_DB:-ecommerce}"]
       interval: 10s
       timeout: 5s
       retries: 5
