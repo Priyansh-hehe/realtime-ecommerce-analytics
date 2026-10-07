@@ -4,9 +4,7 @@ A complete reference guide containing all CLI, Docker, Kafka, PostgreSQL, Python
 
 ---
 
-## ⚡ Quick Start: Resume After Laptop Restart (Multi-Terminal Guide)
-
-Whenever you restart your laptop or open the project, follow this exact sequence:
+## ⚡ Quick Start
 
 ### 🖥️ Terminal 1 — Infrastructure (Start Containers)
 ```powershell
@@ -54,7 +52,7 @@ python src/producer/synthetic_producer.py --scenario CHAOS --rate 30 --max-event
 docker exec -i postgres-ecommerce psql -U ecom_user -d ecommerce -c "SELECT * FROM v_pipeline_latency_metrics;"
 ```
 
----
+----------------------------------------------------------------------------------------------------------------------------------------------
 
 ## 1. Environment & Python Setup
 

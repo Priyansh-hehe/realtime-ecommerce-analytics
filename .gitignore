@@ -1,18 +1,32 @@
-# Python
+# Python & Environment
 __pycache__/
 *.py[cod]
 *$py.class
 .venv/
 venv/
 ENV/
+*.log
+.pytest_cache/
 
-# Environment variables & secrets
+# Environment variables & secrets (CRITICAL: never commit)
 .env
+.env.local
+*.env
 
-# Data files (avoid committing large CSVs)
-data/raw/*.csv
-data/raw/*.xlsx
+# Large raw datasets (avoids Git LFS / GitHub 100MB limits)
+data/raw/*
+!data/raw/.gitkeep
+*.csv
+*.xlsx
+*.parquet
 
-# OS files
+# Development planning & scratch notes
+implementation_plan.md
+notes.md
+scratch/
+
+# IDE & OS files
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
