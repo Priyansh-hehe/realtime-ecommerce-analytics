@@ -142,3 +142,12 @@ SELECT
     ROUND(PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY latency_ms)::numeric, 2) AS p99_latency_ms
 FROM transactions
 WHERE latency_ms IS NOT NULL;
+
+
+-- Ingestion Throughput View (Events per second bucket)
+CREATE OR REPLACE VIEW v_throughput_per_second AS
+SELECT 
+    DATE_TRUNC('second', processed_at) AS time_window,
+    COUNT(*) AS events_per_sec
+FROM transactions
+GROUP BY time_window;
